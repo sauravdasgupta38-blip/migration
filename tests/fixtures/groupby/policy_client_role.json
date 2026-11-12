@@ -1,0 +1,215 @@
+{
+  "table": "policy_client_role",
+  "description": "Target platform party-role entity: one row per client holding a role on a policy, carrying the policy and product attributes needed to service that role.",
+  "attributes": [
+    {
+      "name": "role_record_id",
+      "type": "string",
+      "description": "Unique identifier of the role record."
+    },
+    {
+      "name": "policy_reference",
+      "type": "string",
+      "description": "Reference of the policy the role belongs to."
+    },
+    {
+      "name": "party_id",
+      "type": "string",
+      "description": "Identifier of the party (person, organisation, adviser or branch) holding the role."
+    },
+    {
+      "name": "client_role",
+      "type": "enum",
+      "allowed_values": [
+        "Policy Holder",
+        "Life Assured",
+        "Payer",
+        "Beneficiary",
+        "Annuitant",
+        "Employer",
+        "Guardian",
+        "Adviser",
+        "Servicing Branch"
+      ],
+      "description": "The role the client plays on the policy."
+    },
+    {
+      "name": "client_category",
+      "type": "enum",
+      "allowed_values": [
+        "Individual",
+        "Organisation",
+        "Intermediary",
+        "Staff",
+        "Branch"
+      ],
+      "nullable": true,
+      "description": "Category of the client record."
+    },
+    {
+      "name": "role_status",
+      "type": "enum",
+      "allowed_values": [
+        "ACTIVE",
+        "ENDED",
+        "PENDING"
+      ],
+      "description": "Lifecycle status of the role record."
+    },
+    {
+      "name": "joint_life_sequence",
+      "type": "enum",
+      "allowed_values": [
+        "0",
+        "1",
+        "2"
+      ],
+      "description": "Position of the client within the role: 0 single, 1 first, 2 second."
+    },
+    {
+      "name": "surname_abbreviation",
+      "type": "string",
+      "nullable": true,
+      "description": "Short surname of the first life, used for alphabetical listing. Stored in uppercase with no leading or trailing spaces."
+    },
+    {
+      "name": "role_start_date",
+      "type": "date",
+      "description": "Date the client started in the role."
+    },
+    {
+      "name": "role_end_date",
+      "type": "date",
+      "nullable": true,
+      "description": "Date the client ceased to hold the role; null while the role is open."
+    },
+    {
+      "name": "has_unique_address",
+      "type": "boolean",
+      "description": "True when the party uses a correspondence address unique to this policy."
+    },
+    {
+      "name": "product_type",
+      "type": "enum",
+      "allowed_values": [
+        "Personal Pension",
+        "Stakeholder Pension",
+        "Group Personal Pension",
+        "Immediate Annuity",
+        "Term Assurance"
+      ],
+      "description": "Product the policy was sold under."
+    },
+    {
+      "name": "product_version_number",
+      "type": "integer",
+      "description": "Version of the product terms."
+    },
+    {
+      "name": "is_group_policy",
+      "type": "boolean",
+      "description": "True when the policy belongs to a group (employer-sponsored) arrangement, false otherwise."
+    },
+    {
+      "name": "policy_start_date",
+      "type": "date",
+      "description": "Date the policy commenced (came into force)."
+    },
+    {
+      "name": "paid_up_date",
+      "type": "date",
+      "nullable": true,
+      "description": "Date the policy was made paid up; null if it has never been paid up."
+    },
+    {
+      "name": "maturity_date",
+      "type": "date",
+      "nullable": true,
+      "description": "Current maturity date of the policy; null for products with no maturity."
+    },
+    {
+      "name": "original_maturity_date",
+      "type": "date",
+      "nullable": true,
+      "description": "Maturity date originally agreed at inception, used for projections."
+    },
+    {
+      "name": "policy_status",
+      "type": "enum",
+      "allowed_values": [
+        "IN_FORCE",
+        "PAID_UP",
+        "LAPSED",
+        "MATURED",
+        "SURRENDERED",
+        "TRANSFERRED_OUT",
+        "CLAIMED"
+      ],
+      "description": "Current lifecycle status of the policy."
+    },
+    {
+      "name": "exit_reason",
+      "type": "enum",
+      "allowed_values": [
+        "MATURITY",
+        "SURRENDER",
+        "TRANSFER_OUT",
+        "DEATH",
+        "LAPSE"
+      ],
+      "nullable": true,
+      "description": "Reason the policy exited; null while the policy is active."
+    },
+    {
+      "name": "tax_qualifying_status",
+      "type": "enum",
+      "allowed_values": [
+        "Q",
+        "NQ"
+      ],
+      "value_meanings": {
+        "Q": "Qualifying",
+        "NQ": "Non-Qualifying"
+      },
+      "description": "Whether the policy qualifies for tax relief on the benefit."
+    },
+    {
+      "name": "conditions_book_code",
+      "type": "string",
+      "description": "Code of the policy conditions booklet issued with the policy."
+    },
+    {
+      "name": "service_office_code",
+      "type": "string",
+      "description": "Code of the office responsible for servicing the policy."
+    },
+    {
+      "name": "premium_contribution",
+      "type": "decimal",
+      "nullable": true,
+      "description": "Monthly premium amount in GBP contributed by the party holding this role; null for roles that do not pay premiums."
+    },
+    {
+      "name": "policy_active_role_count",
+      "type": "integer",
+      "description": "Number of active role records held on the policy as a whole (all clients, all roles). Policy-level figure, repeated on every role row of the policy."
+    },
+    {
+      "name": "policy_beneficiary_count",
+      "type": "integer",
+      "description": "Number of active beneficiaries nominated on the policy. Policy-level figure, repeated on every role row of the policy; 0 when no beneficiary is nominated."
+    },
+    {
+      "name": "policy_beneficiary_share_total",
+      "type": "decimal",
+      "nullable": true,
+      "description": "Total of the benefit share percentages across all active beneficiaries of the policy. Policy-level figure, repeated on every role row; null when the policy has no beneficiary."
+    },
+    {
+      "name": "policy_total_monthly_premium",
+      "type": "decimal",
+      "nullable": true,
+      "description": "Total monthly premium in GBP received on the policy, summed over every active role that contributes. Policy-level figure, repeated on every role row (not only the paying role); null for single-premium policies."
+    }
+  ]
+}

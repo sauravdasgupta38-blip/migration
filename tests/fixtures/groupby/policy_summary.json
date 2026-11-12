@@ -1,0 +1,39 @@
+{
+  "table": "policy_summary",
+  "description": "One row per policy: a roll-up of the client roles held on it.",
+  "attributes": [
+    {
+      "name": "policy_reference",
+      "type": "string",
+      "description": "Reference of the policy. Unique - exactly one row per policy."
+    },
+    {
+      "name": "product_type",
+      "type": "enum",
+      "allowed_values": [
+        "Personal Pension",
+        "Stakeholder Pension",
+        "Group Personal Pension",
+        "Immediate Annuity",
+        "Term Assurance"
+      ],
+      "description": "Product the policy was sold under."
+    },
+    {
+      "name": "active_role_count",
+      "type": "integer",
+      "description": "Number of active role records on the policy."
+    },
+    {
+      "name": "beneficiary_count",
+      "type": "integer",
+      "description": "Number of active beneficiaries nominated on the policy."
+    },
+    {
+      "name": "total_monthly_premium",
+      "type": "decimal",
+      "nullable": true,
+      "description": "Total monthly premium in GBP received on the policy across all paying roles."
+    }
+  ]
+}

@@ -1,0 +1,170 @@
+{
+  "table": "CO040",
+  "columns": [
+    {
+      "name": "UNIQUE_ID",
+      "business_name": "Role Record ID",
+      "description": "Unique key of the client-to-policy cross-reference record. One value per record, never re-used.",
+      "inferred_type": "IDENTIFIER"
+    },
+    {
+      "name": "POLREF",
+      "business_name": "Policy Reference",
+      "description": "Reference of the policy the client is attached to.",
+      "inferred_type": "IDENTIFIER",
+      "join_key": true
+    },
+    {
+      "name": "CLIREF",
+      "business_name": "Client Reference",
+      "description": "Reference of the client (person, organisation, adviser or branch) attached to the policy.",
+      "inferred_type": "IDENTIFIER",
+      "aliases": [
+        "Party Identifier",
+        "Customer Number"
+      ]
+    },
+    {
+      "name": "ROLREF",
+      "business_name": "Role Reference",
+      "description": "Code for the role the client holds on the policy.",
+      "inferred_type": "CATEGORICAL_CODE",
+      "aliases": [
+        "Client Role"
+      ],
+      "value_decode": {
+        "PH": "Policy Holder",
+        "LA": "Life Assured",
+        "PY": "Payer",
+        "BN": "Beneficiary",
+        "AN": "Annuitant",
+        "EM": "Employer",
+        "GD": "Guardian",
+        "AGT": "Adviser",
+        "SRV": "Servicing Branch"
+      }
+    },
+    {
+      "name": "CLICAT",
+      "business_name": "Client Category",
+      "description": "Category of the client record. Not captured for some beneficiaries.",
+      "inferred_type": "CATEGORICAL_CODE",
+      "value_decode": {
+        "IND": "Individual",
+        "ORG": "Organisation",
+        "IMD": "Intermediary",
+        "STF": "Staff",
+        "BRN": "Branch"
+      }
+    },
+    {
+      "name": "STAXRF",
+      "business_name": "Cross Reference Status",
+      "description": "Status of the client-to-policy cross-reference record.",
+      "inferred_type": "CATEGORICAL_CODE",
+      "aliases": [
+        "Role Status"
+      ],
+      "value_decode": {
+        "30": "Active",
+        "60": "Ended",
+        "5": "Pending"
+      }
+    },
+    {
+      "name": "JTLIND",
+      "business_name": "Joint Life Indicator",
+      "description": "For policyholder or life assured roles: 0 single life, 1 first life, 2 second life on a joint-life policy. For multi-client roles (e.g. beneficiary) it numbers each client in the role.",
+      "inferred_type": "CATEGORICAL_CODE",
+      "aliases": [
+        "Joint Life Sequence"
+      ],
+      "value_decode": {
+        "0": "Single Life",
+        "1": "First Life or Client",
+        "2": "Second Life or Client"
+      }
+    },
+    {
+      "name": "SCHSUBCAT",
+      "business_name": "Scheme Sub Category",
+      "description": "Sub-category within the employer scheme the policy belongs to. Set only on employer (EM) records; 0 otherwise.",
+      "inferred_type": "CATEGORICAL_CODE"
+    },
+    {
+      "name": "CONDITION_ITR",
+      "business_name": "Conditional Key Field 1",
+      "description": "Technical key used by the legacy file handler. Carries no information beyond UNIQUE_ID; 0 on pending records.",
+      "inferred_type": "IDENTIFIER"
+    },
+    {
+      "name": "CONDITION_SUB",
+      "business_name": "Conditional Key Field 2",
+      "description": "Technical key used by the legacy file handler. Carries no information beyond UNIQUE_ID.",
+      "inferred_type": "IDENTIFIER"
+    },
+    {
+      "name": "SURABR",
+      "business_name": "Surname Abbreviation",
+      "description": "Abbreviated surname of the first life, used to list policies in surname order. Keyed by hand, so case and spacing are inconsistent.",
+      "inferred_type": "FREE_TEXT"
+    },
+    {
+      "name": "ENDDTE",
+      "business_name": "Role End Date",
+      "description": "Date from which the client no longer holds the role, in YYYYMMDD format. 00000000 while the role is open.",
+      "inferred_type": "DATE_YYYYMMDD"
+    },
+    {
+      "name": "STRDTE",
+      "business_name": "Role Start Date",
+      "description": "Start date of the cross-reference record, in YYYYMMDD format.",
+      "inferred_type": "DATE_YYYYMMDD"
+    },
+    {
+      "name": "APLSTA",
+      "business_name": "Application Status",
+      "description": "Not populated in this extract.",
+      "inferred_type": "EMPTY"
+    },
+    {
+      "name": "UNQADRIND",
+      "business_name": "Unique Address Indicator",
+      "description": "Set when the client holds a correspondence address specific to this policy.",
+      "inferred_type": "FLAG",
+      "value_decode": {
+        "0": "No",
+        "1": "Yes"
+      }
+    },
+    {
+      "name": "CTBAMT",
+      "business_name": "Premium Contribution Amount",
+      "description": "Monthly premium amount in GBP paid by this client towards the policy. Held only on the paying role (the payer, else the policyholder); blank for roles that do not pay. 0.00 once premiums have stopped.",
+      "inferred_type": "DECIMAL",
+      "aliases": [
+        "Premium Contribution",
+        "Contribution Amount"
+      ]
+    },
+    {
+      "name": "BENPCT",
+      "business_name": "Beneficiary Benefit Share Percentage",
+      "description": "Percentage of the death benefit nominated to this beneficiary, 0-100 with two decimals. Held only on BN (Beneficiary) records; blank on every other role.",
+      "inferred_type": "DECIMAL",
+      "aliases": [
+        "Nomination Percentage",
+        "Benefit Share"
+      ]
+    }
+  ],
+  "rules": [
+    "Several records per policy: one per client per role, with history kept as ended records.",
+    "ENDDTE is 00000000 while STAXRF is 30 (Active) or 5 (Pending); it is set when STAXRF is 60 (Ended).",
+    "CONDITION_ITR is 0 when STAXRF is 5 (Pending).",
+    "EM (Employer) roles appear only on GP-40 policies; AN (Annuitant) only on IR-05 policies.",
+    "SCHSUBCAT is populated only on EM records.",
+    "CTBAMT is populated on exactly one role per regular-premium policy: the PY record if present, otherwise the PH record. It is blank on all other roles and on IR-05 (single premium) policies, and 0.00 where the policy is no longer in force.",
+    "BENPCT is populated only on BN records; the BENPCT values of the active BN records of a policy add up to 100."
+  ]
+}

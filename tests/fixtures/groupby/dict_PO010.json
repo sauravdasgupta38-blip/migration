@@ -1,0 +1,160 @@
+{
+  "table": "PO010",
+  "columns": [
+    {
+      "name": "POLREF",
+      "business_name": "Policy Reference",
+      "description": "Unique reference of the policy on the policy file.",
+      "inferred_type": "IDENTIFIER",
+      "aliases": [
+        "Policy Number"
+      ],
+      "join_key": true
+    },
+    {
+      "name": "PRDREF",
+      "business_name": "Product Reference",
+      "description": "Code of the product the policy was sold under.",
+      "inferred_type": "CATEGORICAL_CODE",
+      "aliases": [
+        "Product Type",
+        "Plan Type"
+      ],
+      "value_decode": {
+        "RS-11": "Personal Pension",
+        "RS-22": "Stakeholder Pension",
+        "GP-40": "Group Personal Pension",
+        "IR-05": "Immediate Annuity",
+        "TD-30": "Term Assurance"
+      }
+    },
+    {
+      "name": "PRDVRS_NO",
+      "business_name": "Product Version Number",
+      "description": "Version of the product terms the policy was issued on.",
+      "inferred_type": "INTEGER"
+    },
+    {
+      "name": "POLCRCDTE",
+      "business_name": "Policy Currency Date",
+      "description": "Date the policy came into force, in YYYYMMDD format.",
+      "inferred_type": "DATE_YYYYMMDD",
+      "aliases": [
+        "Policy Start Date",
+        "Commencement Date"
+      ]
+    },
+    {
+      "name": "STRDTE",
+      "business_name": "Record Start Date",
+      "description": "Date from which the details on this policy record apply. For endorsements this may be later than the currency date. YYYYMMDD format.",
+      "inferred_type": "DATE_YYYYMMDD",
+      "aliases": [
+        "Endorsement Effective Date"
+      ]
+    },
+    {
+      "name": "EXTMOD",
+      "business_name": "Exit Reason",
+      "description": "Reason the case has exited. 0 means the policy has not exited. Values are held in GSDs and CS060.",
+      "inferred_type": "CATEGORICAL_CODE",
+      "value_decode": {
+        "0": "Not Exited",
+        "11": "Maturity",
+        "12": "Surrender",
+        "13": "Transfer Out",
+        "14": "Death",
+        "15": "Lapse"
+      }
+    },
+    {
+      "name": "PUPDTE",
+      "business_name": "Paid Up Date",
+      "description": "Date from which paid-up details apply, in YYYYMMDD format. 00000000 means the policy has never been made paid up.",
+      "inferred_type": "DATE_YYYYMMDD"
+    },
+    {
+      "name": "ORIMATDTE",
+      "business_name": "Original Maturity Date",
+      "description": "Maturity date agreed at inception, required for projections, in YYYYMMDD format. Initially the same as POLMATDTE; differs where the maturity has since been moved. 00000000 for products with no maturity.",
+      "inferred_type": "DATE_YYYYMMDD"
+    },
+    {
+      "name": "POLMATDTE",
+      "business_name": "Policy Maturity Date",
+      "description": "Current maturity date of the policy, in YYYYMMDD format. 00000000 for products with no maturity (annuities).",
+      "inferred_type": "DATE_YYYYMMDD",
+      "aliases": [
+        "Maturity Date"
+      ]
+    },
+    {
+      "name": "STAPOL",
+      "business_name": "Policy Status",
+      "description": "Current lifecycle status of the policy record. Values are held on GSDs and CS060.",
+      "inferred_type": "CATEGORICAL_CODE",
+      "value_decode": {
+        "20": "In Force",
+        "25": "Paid Up",
+        "40": "Lapsed",
+        "50": "Matured",
+        "60": "Surrendered",
+        "70": "Transferred Out",
+        "80": "Claimed"
+      }
+    },
+    {
+      "name": "QLYPOL",
+      "business_name": "Qualifying Policy",
+      "description": "Whether the policy qualifies for tax relief on the benefit. Obtained from the corresponding PR010 record.",
+      "inferred_type": "CATEGORICAL_CODE",
+      "aliases": [
+        "Tax Qualifying Status"
+      ],
+      "value_decode": {
+        "Y": "Qualifying",
+        "N": "Non-Qualifying"
+      }
+    },
+    {
+      "name": "PRMBAS",
+      "business_name": "Premium Basis",
+      "description": "Regulatory basis the premium was calculated on.",
+      "inferred_type": "CATEGORICAL_CODE",
+      "value_decode": {
+        "S": "Scottish Life Basis",
+        "L": "LAUTRO Basis"
+      }
+    },
+    {
+      "name": "CNDBK_CDE",
+      "business_name": "Conditions Book Code",
+      "description": "Identifies the policy conditions booklet issued with the policy.",
+      "inferred_type": "FREE_TEXT"
+    },
+    {
+      "name": "PRODUCT_CHARGE_BASIS",
+      "business_name": "Product Charge Basis",
+      "description": "Charge basis for an RS policy. Control field with a constant value of 0 in this extract.",
+      "inferred_type": "CONSTANT"
+    },
+    {
+      "name": "SRVBRN",
+      "business_name": "Servicing Branch Code",
+      "description": "Alpha code of the branch that services the policy, validated against the location dataset CL570.",
+      "inferred_type": "FREE_TEXT",
+      "aliases": [
+        "Service Office",
+        "Servicing Office"
+      ]
+    }
+  ],
+  "rules": [
+    "Each policy is uniquely identified by POLREF.",
+    "All dates on this file are YYYYMMDD text; 00000000 means no date.",
+    "PUPDTE is 00000000 unless STAPOL is 25 (Paid Up).",
+    "EXTMOD is 0 while the policy is in force or paid up; otherwise it gives the exit route that matches STAPOL.",
+    "ORIMATDTE equals POLMATDTE unless the maturity date has been moved since inception.",
+    "POLMATDTE and ORIMATDTE are 00000000 for Immediate Annuity (IR-05) policies."
+  ]
+}

@@ -1,0 +1,700 @@
+--- a/mapping_agent.py
++++ b/mapping_agent.py
+@@ -18,6 +18,8 @@
+ import json
+ import os
+ import re
++import time
++import traceback
+ from typing import Optional
+ 
+ from ..models import Gate, decide_gate, target_attributes, target_table_name
+@@ -28,6 +30,272 @@
+ SENTINELS = ("00000000", "")
+ 
+ 
++# ------------------------------------------------------------ LLM call tracing
++# Print-only diagnostics for every LLM round-trip. Set DATAMAP_LLM_TRACE=0 to
++# silence. Nothing here changes control flow: a failure is printed and then
++# re-raised, so each tier's existing fallback runs exactly as before.
++_LLM_TRACE_ON = os.getenv("DATAMAP_LLM_TRACE", "1") != "0"
++_LLM_STATS: dict = {}
++_LLM_STAT_KEYS = ("calls", "json_ok", "call_failed", "bad_json", "unknown_error",
++                  "reply_issues", "offline")
++_LLM_NET_MODULES = ("openai", "httpx", "httpcore", "requests", "urllib3", "azure", "aiohttp")
++_LLM_NET_NAMES = ("timeout", "connection", "ratelimit", "authentication", "permissiondenied",
++                  "apierror", "apistatus", "badrequest", "notfound", "internalserver",
++                  "serviceunavailable", "gateway")
++
++
++def _llm_log(stage: str, tag: str, msg: str) -> None:
++    if _LLM_TRACE_ON:
++        print(f"[LLM][{stage}][{tag}] {msg}", flush=True)
++
++
++def _llm_bump(stage: str, key: str, n: int = 1) -> dict:
++    s = _LLM_STATS.setdefault(stage, dict.fromkeys(_LLM_STAT_KEYS, 0))
++    s[key] += n
++    return s
++
++
++def _llm_drop(stage: str, msg: str) -> None:
++    """A proposal the model returned that downstream code had to discard."""
++    _llm_bump(stage, "reply_issues")
++    _llm_log(stage, "DROP", msg)
++
++
++def _llm_preview(obj, limit: int = 300) -> str:
++    try:
++        text = obj if isinstance(obj, str) else json.dumps(obj, default=str)
++    except Exception:                                   # noqa: BLE001
++        text = repr(obj)
++    return text if len(text) <= limit else f"{text[:limit]}... (+{len(text) - limit} chars)"
++
++
++def _llm_short(items: list, limit: int = 8) -> str:
++    shown = ", ".join(str(i) for i in items[:limit])
++    return shown + (f" (+{len(items) - limit} more)" if len(items) > limit else "")
++
++
++def _llm_classify(exc: Exception) -> tuple[str, str]:
++    """Best-effort split of a failure into 'the call broke' vs 'the reply was bad'."""
++    name = type(exc).__name__.lower()
++    module = (type(exc).__module__ or "").lower()
++    text = str(exc).lower()
++    if isinstance(exc, json.JSONDecodeError):
++        return "bad_json", "reply is not valid JSON"
++    if module.startswith(_LLM_NET_MODULES) or any(k in name for k in _LLM_NET_NAMES):
++        return "call_failed", "the request itself failed (network/auth/quota/gateway/bad request)"
++    if any(k in text for k in ("finish_reason", "max_tokens", "truncat")):
++        return "bad_json", "reply was cut off before the JSON was complete"
++    if isinstance(exc, (ValueError, TypeError, KeyError, AttributeError)):
++        return "bad_json", "reply could not be turned into the expected JSON object"
++    return "unknown_error", "unclassified failure (traceback below)"
++
++
++def _llm_client(stage: str, config):
++    """config.llm_client() with the outcome printed. Re-raises on failure."""
++    try:
++        client, model = config.llm_client()
++    except Exception as exc:                            # noqa: BLE001
++        _llm_bump(stage, "calls")
++        _llm_bump(stage, "call_failed")
++        _llm_log(stage, "FAIL", f"could not create the LLM client — {type(exc).__name__}: {exc}")
++        raise
++    if client is None:
++        _llm_bump(stage, "offline")
++        _llm_log(stage, "SKIP", "no LLM configured (offline) — this stage makes no call")
++    return client, model
++
++
++def _llm_call(stage: str, client, model, messages: list, **kwargs) -> dict:
++    """_llm_json with every outcome printed. Exceptions are re-raised and the
++    reply is returned untouched, so each caller fails exactly as it did before."""
++    n = _llm_bump(stage, "calls")["calls"]
++    chars = sum(len(str(m.get("content") or "")) for m in messages)
++    _llm_log(stage, "CALL", f"#{n} model={model} prompt_chars={chars:,} "
++                            f"max_tokens={kwargs.get('max_tokens', 'default')}")
++    t0 = time.perf_counter()
++    try:
++        out = _llm_json(client, model, messages, **kwargs)
++    except Exception as exc:                            # noqa: BLE001
++        kind, why = _llm_classify(exc)
++        _llm_bump(stage, kind)
++        _llm_log(stage, "FAIL", f"#{n} after {time.perf_counter() - t0:.1f}s — {kind.upper()}: "
++                                f"{why} | {type(exc).__name__}: {_llm_preview(str(exc), 500)}")
++        if kind == "unknown_error" and _LLM_TRACE_ON:
++            print(traceback.format_exc(limit=5), flush=True)
++        raise
++    secs = time.perf_counter() - t0
++    if not isinstance(out, dict):
++        _llm_bump(stage, "bad_json")
++        _llm_log(stage, "FAIL", f"#{n} after {secs:.1f}s — BAD_JSON: expected a JSON object, "
++                                f"got {type(out).__name__}: {_llm_preview(out)}")
++        return out                              # caller's .get() fails as before
++    _llm_bump(stage, "json_ok")
++    _llm_log(stage, "OK", f"#{n} in {secs:.1f}s — JSON object, keys={sorted(out)}")
++    return out
++
++
++def _llm_check_keyed(stage: str, out: dict, section: str, expected: list, *,
++                     required=(), bools=(), dicts=(), source_field=None,
++                     valid_sources=None) -> None:
++    """Audit a {section: {<target>: {...}}} reply against what downstream reads.
++
++    Print-only: never raises, never modifies the reply.
++    """
++    try:
++        raw = out.get(section)
++        if not isinstance(raw, dict):
++            _llm_bump(stage, "reply_issues")
++            what = "missing" if raw is None else f"a {type(raw).__name__}, not an object"
++            _llm_log(stage, "WARN", f"key '{section}' is {what} (top-level keys: {sorted(out)}) — "
++                                    f"nothing in this reply is usable"
++                                    + ("" if raw is None else "; downstream .get() on it will raise"))
++            return
++        problems: dict = {}
++        for name in expected:
++            if name not in raw:
++                problems.setdefault("no entry returned", []).append(name)
++                continue
++            entry = raw[name]
++            if not isinstance(entry, dict):
++                problems.setdefault("entry is not an object", []).append(
++                    f"{name}={_llm_preview(entry, 60)}")
++                continue
++            for f in required:
++                if f not in entry:
++                    problems.setdefault(f"missing field '{f}'", []).append(name)
++            for f in bools:
++                if f in entry and not isinstance(entry[f], bool):
++                    problems.setdefault(f"'{f}' is not true/false", []).append(f"{name}={entry[f]!r}")
++            for f in dicts:
++                if f in entry and not isinstance(entry[f], dict):
++                    problems.setdefault(f"'{f}' is not an object", []).append(name)
++            if source_field and entry.get(source_field) is not None:
++                sid = entry[source_field]
++                if not isinstance(sid, str):
++                    problems.setdefault(f"'{source_field}' is not a string", []).append(f"{name}={sid!r}")
++                elif valid_sources is not None and sid not in valid_sources:
++                    problems.setdefault(f"'{source_field}' is not a known source column", []).append(
++                        f"{name}->{sid!r}")
++        wanted = set(expected)
++        extra = [k for k in raw if k not in wanted]
++        if extra:
++            problems["unexpected target name (renamed or misspelt?)"] = extra
++        usable = sum(1 for name in expected if isinstance(raw.get(name), dict))
++        issues = sum(len(v) for v in problems.values())
++        _llm_log(stage, "CHECK", f"{usable}/{len(expected)} target(s) answered in usable form, "
++                                 f"{issues} issue(s)")
++        for label, items in problems.items():
++            _llm_log(stage, "WARN", f"{label}: {_llm_short(items)}")
++        if issues:
++            _llm_bump(stage, "reply_issues", issues)
++    except Exception as exc:                            # noqa: BLE001
++        _llm_log(stage, "WARN", f"reply check itself failed: {type(exc).__name__}: {exc}")
++
++
++def _llm_check_synth(out: dict, asked: list) -> None:
++    """Audit {"results": [{target, sql, reason}]} for _llm_synthesise. Print-only."""
++    stage = "synthesise"
++    try:
++        raw = out.get("results")
++        if not isinstance(raw, list):
++            _llm_bump(stage, "reply_issues")
++            what = "missing" if raw is None else f"a {type(raw).__name__}, not a list"
++            _llm_log(stage, "WARN", f"key 'results' is {what} (top-level keys: {sorted(out)}) — "
++                                    f"nothing in this reply is usable")
++            return
++        problems: dict = {}
++        seen, declined = [], []
++        for i, r in enumerate(raw):
++            if not isinstance(r, dict):
++                problems.setdefault("result is not an object (whole stage will be skipped)",
++                                    []).append(f"#{i}={_llm_preview(r, 60)}")
++                continue
++            t = r.get("target")
++            if not isinstance(t, str) or t not in asked:
++                problems.setdefault("unknown or missing 'target'", []).append(f"#{i}={t!r}")
++                continue
++            if t in seen:
++                problems.setdefault("duplicate target (last one wins)", []).append(t)
++            seen.append(t)
++            sql = r.get("sql")
++            if sql is None or sql == "":
++                declined.append(t)
++            elif not isinstance(sql, str):
++                problems.setdefault("'sql' is not a string (downstream .strip() will raise)",
++                                    []).append(f"{t}={sql!r}")
++        missing = [t for t in asked if t not in seen]
++        if missing:
++            problems["no result returned"] = missing
++        issues = sum(len(v) for v in problems.values())
++        _llm_log(stage, "CHECK", f"{len(set(seen))}/{len(asked)} target(s) answered, "
++                                 f"{len(declined)} declined (sql=null), {issues} issue(s)")
++        for label, items in problems.items():
++            _llm_log(stage, "WARN", f"{label}: {_llm_short(items)}")
++        if issues:
++            _llm_bump(stage, "reply_issues", issues)
++    except Exception as exc:                            # noqa: BLE001
++        _llm_log(stage, "WARN", f"reply check itself failed: {type(exc).__name__}: {exc}")
++
++
++def _llm_check_narrate(parsed: dict, known: list) -> None:
++    """Audit {"mappings": [{target_attribute, rationale}]} for _narrate. Print-only."""
++    stage = "narrate"
++    try:
++        items = parsed.get("mappings", [])
++        if not isinstance(items, list):
++            _llm_bump(stage, "reply_issues")
++            _llm_log(stage, "WARN", f"key 'mappings' is {type(items).__name__}, not a list — "
++                                    f"refinement will be skipped")
++            return
++        known_set = set(known)
++        malformed = [f"#{i}" for i, it in enumerate(items)
++                     if not isinstance(it, dict) or not isinstance(it.get("target_attribute"), str)]
++        unknown = [it["target_attribute"] for it in items
++                   if isinstance(it, dict) and isinstance(it.get("target_attribute"), str)
++                   and it["target_attribute"] not in known_set]
++        returned = {it["target_attribute"] for it in items
++                    if isinstance(it, dict) and isinstance(it.get("target_attribute"), str)}
++        _llm_log(stage, "CHECK", f"{len(returned & known_set)}/{len(known_set)} mapping(s) got a "
++                                 f"rationale, {len(malformed) + len(unknown)} issue(s)")
++        if malformed:
++            _llm_log(stage, "WARN", f"item without a string 'target_attribute' (refinement will be "
++                                    f"skipped): {_llm_short(malformed)}")
++        if unknown:
++            _llm_log(stage, "WARN", f"rationale for unknown target (ignored): {_llm_short(unknown)}")
++        if malformed or unknown:
++            _llm_bump(stage, "reply_issues", len(malformed) + len(unknown))
++    except Exception as exc:                            # noqa: BLE001
++        _llm_log(stage, "WARN", f"reply check itself failed: {type(exc).__name__}: {exc}")
++
++
++def _llm_print_summary() -> None:
++    """One block at the end of map_to_target: did every LLM call work?"""
++    if not _LLM_TRACE_ON:
++        return
++    print("[LLM] ==================== LLM call summary ====================", flush=True)
++    calls = failed = issues = 0
++    for stage, s in _LLM_STATS.items():
++        bad = s["call_failed"] + s["bad_json"] + s["unknown_error"]
++        calls += s["calls"]
++        failed += bad
++        issues += s["reply_issues"]
++        flag = ("SKIP" if s["calls"] == 0 else "FAIL" if bad
++                else "WARN" if s["reply_issues"] else "OK  ")
++        print(f"[LLM] {flag} {stage:<11} calls={s['calls']} json_ok={s['json_ok']} "
++              f"call_failed={s['call_failed']} bad_json={s['bad_json']} "
++              f"unknown_error={s['unknown_error']} reply_issues={s['reply_issues']} "
++              f"offline={s['offline']}", flush=True)
++    if calls == 0:
++        verdict = "NO LLM CALLS WERE MADE — nothing was verified (offline, or no stage needed the model)"
++    elif failed == 0 and issues == 0:
++        verdict = f"ALL {calls} LLM call(s) succeeded and returned usable JSON"
++    else:
++        verdict = (f"{failed} failed call(s) and {issues} unusable reply item(s) across "
++                   f"{calls} LLM call(s) — search the log for [FAIL], [WARN] and [DROP]")
++    print(f"[LLM] {verdict}", flush=True)
++
++
++
+ # ------------------------------------------------------------------ helpers
+ def _lit(value: str) -> str:
+     """A single-quoted SQL literal with embedded quotes doubled."""
+@@ -545,7 +813,7 @@
+     """
+     from .. import config
+     try:
+-        client, model = config.llm_client()
++        client, model = _llm_client("propose", config)
+     except Exception as exc:                    # noqa: BLE001
+         _LLM_PROPOSE_FAILURE.setdefault("error", f"{type(exc).__name__}: {exc}")
+         return
+@@ -581,13 +849,18 @@
+             "sources": source_digest,
+         }
+         try:
+-            out = _llm_json(client, model,
++            out = _llm_call("propose", client, model,
+                             [{"role": "system", "content": _RECOVER_SYS},
+                              {"role": "user", "content": json.dumps(payload, default=str)}],
+                             max_tokens=150 + 120 * len(chunk))
++            _llm_check_keyed("propose", out, "proposals", [t["name"] for t in chunk],
++                             required=("source",), source_field="source",
++                             valid_sources=by_name)
+             proposals = out.get("proposals") or {}
+         except Exception as exc:                # noqa: BLE001
+             _LLM_PROPOSE_FAILURE.setdefault("error", f"{type(exc).__name__}: {exc}")
++            _llm_log("propose", "STOP", f"batch {i // _PROPOSE_BATCH + 1} failed — no further "
++                                        f"propose calls this run")
+             return
+         _PROPOSE_STATE["batched"] = True
+         for t in chunk:
+@@ -628,8 +901,12 @@
+     if cached is not None:
+         return cached                           # answered by the batched pass
+     if _PROPOSE_STATE["batched"]:
++        _llm_log("propose", "WARN", f"{target['name']}: no usable proposal from the batched "
++                                    f"pass — recorded as 'model has no view' (has_view=False)")
+         return None, "", False                  # batch ran and had no view on it
+     if _LLM_PROPOSE_FAILURE.get("error"):
++        _llm_log("propose", "SKIP", f"{target['name']}: not asked — an earlier propose call "
++                                    f"failed, semantic check unavailable (has_view=None)")
+         return None, "", None                   # already failed; don't hammer it
+ 
+     def _samples(col_name: str) -> list[str]:
+@@ -660,10 +937,12 @@
+         "sources": source_digest,
+     }
+     try:
+-        out = _llm_json(client, model,
++        out = _llm_call("propose", client, model,
+                         [{"role": "system", "content": _RECOVER_SYS},
+                          {"role": "user", "content": json.dumps(payload, default=str)}],
+                         max_tokens=250)
++        _llm_check_keyed("propose", out, "proposals", [target["name"]],
++                         required=("source",), source_field="source", valid_sources=by_name)
+         proposals = out.get("proposals") or {}
+         p = proposals.get(target["name"]) or {}
+         if not isinstance(p, dict):
+@@ -677,6 +956,8 @@
+         return src.name, (p.get("reason") or ""), True
+     except Exception as exc:                    # noqa: BLE001
+         _LLM_PROPOSE_FAILURE.setdefault("error", f"{type(exc).__name__}: {exc}")
++        _llm_log("propose", "STOP", f"{target['name']}: per-target call failed — semantic "
++                                    f"check unavailable (has_view=None)")
+         return None, "", None
+ 
+ 
+@@ -1038,6 +1319,7 @@
+ 
+     candidates = [c for c in enriched.columns if not _dead(c)]
+     _LLM_PROPOSE_FAILURE.clear()                # per-run, not per-process
++    _LLM_STATS.clear()
+     _PROPOSE_CACHE.clear()
+     _PROPOSE_STATE["batched"] = False
+     _llm_propose_all(target_attributes(target_dict), by_name, warehouse, source_table)
+@@ -1302,7 +1584,9 @@
+     _recompute_stats(spec, target_dict)
+     _annotate_source_files(spec, by_name, enriched.table)
+     _list_unmapped_as_rejects(spec, target_dict)
+-    return _narrate(spec, enriched, target_dict)
++    spec = _narrate(spec, enriched, target_dict)
++    _llm_print_summary()
++    return spec
+ 
+ 
+ def _drop_self_alternatives(spec: MappingSpec) -> None:
+@@ -1663,7 +1947,7 @@
+     against real data exactly like the deterministic path. Recovered matches are
+     capped at REVIEW — the human confirms the cross-vocabulary equivalence."""
+     from .. import config
+-    client, model = config.llm_client()
++    client, model = _llm_client("recover", config)
+     if client is None:
+         return                                    # offline: behave exactly as before
+ 
+@@ -1707,10 +1991,12 @@
+                    "sources": src_digest}
+         # ~120 output tokens per target, with headroom, so a full batch cannot
+         # be truncated (finish_reason=length raises inside _llm_json)
+-        out = _llm_json(client, model,
++        out = _llm_call("recover", client, model,
+                         [{"role": "system", "content": _RECOVER_SYS},
+                          {"role": "user", "content": json.dumps(payload, default=str)}],
+                         max_tokens=200 + 150 * len(targets))
++        _llm_check_keyed("recover", out, "proposals", [t["name"] for t in targets],
++                         required=("source",), source_field="source", valid_sources=by_name)
+         props = out.get("proposals") or {}
+         resolved = {}
+         for t in targets:
+@@ -1734,11 +2020,16 @@
+             chunk = targets[i:i + _RECOVER_BATCH]
+             try:
+                 out.update(_ask(chunk))
+-            except Exception:                                 # noqa: BLE001
++            except Exception as exc:                          # noqa: BLE001
++                _llm_log("recover", "RETRY", f"batch of {len(chunk)} failed "
++                                             f"({type(exc).__name__}: {_llm_preview(str(exc), 200)}) "
++                                             f"— retrying one target at a time")
+                 for t in chunk:
+                     try:
+                         out.update(_ask([t]))
+-                    except Exception:                         # noqa: BLE001
++                    except Exception as exc2:                 # noqa: BLE001
++                        _llm_log("recover", "GIVEUP", f"{t['name']}: individual retry failed "
++                                                      f"({type(exc2).__name__}) — no proposal")
+                         out[t["name"]] = (None, "")
+         return out
+ 
+@@ -1777,6 +2068,12 @@
+         if tgt["name"] not in seen:
+             seen.add(tgt["name"]); wanted.append(tgt)
+     proposals = _resolve(wanted)
++    if not wanted:
++        _llm_log("recover", "SKIP", "nothing below auto-accept or unmapped — no call needed")
++    else:
++        _llm_log("recover", "DONE", f"{sum(1 for s, _ in proposals.values() if s is not None)}"
++                                    f"/{len(wanted)} target(s) got a usable source proposal "
++                                    f"(each is still validated against data below)")
+ 
+     # ---- apply, with the SAME per-target validation as before --------------
+     for m, tgt in recover_mappings:
+@@ -1907,7 +2204,7 @@
+ # ----------------------------------------------------- LLM refinement (optional)
+ def _narrate(spec: MappingSpec, enriched: EnrichedDictionary, target_dict: dict) -> MappingSpec:
+     from .. import config
+-    client, model = config.llm_client()
++    client, model = _llm_client("narrate", config)
+     if client is None:
+         spec.generated_by = "deterministic+offline_stub"
+         return spec
+@@ -1920,20 +2217,54 @@
+         "'mappings' (list of {target_attribute, rationale})."
+     )
+     try:
+-        resp = client.chat.completions.create(
+-            model=model, temperature=0,
+-            response_format={"type": "json_object"},
+-            messages=[{"role": "system", "content": sys},
+-                      {"role": "user", "content": json.dumps(
+-                          {"target": target_dict, "draft": spec.model_dump()}, default=str)}],
+-        )
++        messages = [{"role": "system", "content": sys},
++                    {"role": "user", "content": json.dumps(
++                        {"target": target_dict, "draft": spec.model_dump()}, default=str)}]
++        n = _llm_bump("narrate", "calls")["calls"]
++        _llm_log("narrate", "CALL", f"#{n} model={model} prompt_chars="
++                                    f"{sum(len(m['content']) for m in messages):,} max_tokens=default")
++        t0 = time.perf_counter()
++        try:
++            resp = client.chat.completions.create(
++                model=model, temperature=0,
++                response_format={"type": "json_object"},
++                messages=messages,
++            )
++        except Exception as exc:                    # noqa: BLE001
++            _llm_bump("narrate", "call_failed")
++            _llm_log("narrate", "FAIL", f"#{n} after {time.perf_counter() - t0:.1f}s — CALL_FAILED: "
++                                        f"{type(exc).__name__}: {_llm_preview(str(exc), 500)}")
++            raise
++        secs = time.perf_counter() - t0
++        choice = resp.choices[0] if getattr(resp, "choices", None) else None
++        finish = getattr(choice, "finish_reason", None)
++        content = getattr(getattr(choice, "message", None), "content", None)
++        if finish not in (None, "stop"):
++            _llm_log("narrate", "WARN", f"#{n} finish_reason={finish!r} — reply truncated or filtered")
++        try:
++            parsed = json.loads(content)
++        except Exception as exc:                    # noqa: BLE001
++            _llm_bump("narrate", "bad_json")
++            _llm_log("narrate", "FAIL", f"#{n} after {secs:.1f}s — BAD_JSON: {type(exc).__name__}: "
++                                        f"{exc} | content={_llm_preview(content)}")
++            raise
++        if not isinstance(parsed, dict):
++            _llm_bump("narrate", "bad_json")
++            _llm_log("narrate", "FAIL", f"#{n} after {secs:.1f}s — BAD_JSON: expected a JSON object, "
++                                        f"got {type(parsed).__name__}: {_llm_preview(parsed)}")
++            raise TypeError("narrate: LLM reply is not a JSON object")
++        _llm_bump("narrate", "json_ok")
++        _llm_log("narrate", "OK", f"#{n} in {secs:.1f}s — JSON object, keys={sorted(parsed)}")
++        _llm_check_narrate(parsed, [m.target_attribute for m in spec.mappings])
+         upd = {m["target_attribute"]: m.get("rationale", "")
+-               for m in json.loads(resp.choices[0].message.content).get("mappings", [])}
++               for m in parsed.get("mappings", [])}
+         for m in spec.mappings:
+             if upd.get(m.target_attribute):
+                 m.rationale = upd[m.target_attribute]
+         spec.generated_by = "deterministic+llm"
+     except Exception as e:
++        _llm_log("narrate", "STOP", f"rationale refinement skipped ({type(e).__name__}) — "
++                                    f"deterministic rationales kept")
+         spec.stats["llm_note"] = f"refinement skipped: {e}"
+         spec.generated_by = "deterministic+offline_stub"
+     return spec
+@@ -1988,7 +2319,7 @@
+     stands, so this tier can only improve on what was there.
+     """
+     from .. import config
+-    client, model = config.llm_client()
++    client, model = _llm_client("synthesise", config)
+     if client is None:
+         return                                   # offline: nothing changes
+ 
+@@ -2026,6 +2357,7 @@
+         gapped.append(ph)
+ 
+     if not gapped:
++        _llm_log("synthesise", "SKIP", "no gapped, rejected or unmapped targets — no call needed")
+         return
+ 
+     cols = warehouse.column_names(source_table)
+@@ -2053,11 +2385,14 @@
+     user = json.dumps({"source_columns": src_digest, "targets": asks}, default=str)
+ 
+     try:
+-        out = _llm_json(client, model,
++        out = _llm_call("synthesise", client, model,
+                         [{"role": "system", "content": system},
+                          {"role": "user", "content": user}])
++        _llm_check_synth(out, [a["target"] for a in asks])
+         results = {r.get("target"): r for r in (out.get("results") or [])}
+     except Exception as exc:                     # noqa: BLE001
++        _llm_log("synthesise", "STOP", f"stage skipped ({type(exc).__name__}) — deterministic "
++                                       f"transforms stand")
+         spec.stats["llm_note"] = f"transform synthesis skipped: {exc}"
+         return
+ 
+@@ -2066,18 +2401,26 @@
+         r = results.get(m.target_attribute) or {}
+         proposed = (r.get("sql") or "").strip().rstrip(";")
+         if not proposed:
++            _llm_log("synthesise", "SKIP", f"{m.target_attribute}: no SQL proposed")
+             continue
+         referenced = set(re.findall(r'"([^"]+)"', proposed))
+         if not referenced or not referenced <= set(cols):
++            _llm_drop("synthesise", f"{m.target_attribute}: SQL quotes no columns or unknown "
++                                    f"columns {sorted(referenced - set(cols))} — {proposed[:200]}")
+             continue                             # invented a column: discard
+         if re.search(r"\b(select|from|insert|update|delete|drop|attach)\b",
+                      proposed, re.I):
++            _llm_drop("synthesise", f"{m.target_attribute}: SQL is a statement, not a scalar "
++                                    f"expression — {proposed[:200]}")
+             continue                             # a statement, not an expression
+         before = (_validate(warehouse, source_table, m.transformation_sql,
+                             m.source_attributes)
+                   if m.transformation_sql else None)
+         after = _validate(warehouse, source_table, proposed, sorted(referenced))
+         if after is None or (before is not None and after < before):
++            _llm_drop("synthesise", f"{m.target_attribute}: " + (
++                "SQL failed to execute on the staged data" if after is None
++                else f"coverage fell from {before:.0%} to {after:.0%}") + f" — {proposed[:200]}")
+             continue                             # did not execute, or lost rows
+ 
+         m.transformation_sql = proposed
+@@ -2112,6 +2455,7 @@
+                 u for u in spec.unmapped_target
+                 if (u["attribute"] if isinstance(u, dict)
+                     else getattr(u, "attribute", None)) != name]
++    _llm_log("synthesise", "DONE", f"{applied}/{len(gapped)} composite transform(s) applied")
+     if applied:
+         spec.stats["llm_transforms"] = applied
+ 
+@@ -2173,13 +2517,14 @@
+     a no-op and the deterministic gates stand.
+     """
+     from .. import config
+-    client, model = config.llm_client()
++    client, model = _llm_client("verify", config)
+     if client is None:
+         return
+ 
+     auto = [m for m in spec.mappings
+             if m.gate == Gate.AUTO_ACCEPT.value and m.source_attributes]
+     if not auto:
++        _llm_log("verify", "SKIP", "no auto-accepted mappings — no call needed")
+         return
+     by_target = {a["name"]: a for a in target_attributes(target_dict)}
+ 
+@@ -2208,13 +2553,18 @@
+         })
+ 
+     try:
+-        out = _llm_json(client, model,
++        out = _llm_call("verify", client, model,
+                         [{"role": "system", "content": _VERIFY_SYS},
+                          {"role": "user", "content": json.dumps(
+                              {"mappings": payload}, default=str)}],
+                         max_tokens=200 + 120 * len(payload))
++        _llm_check_keyed("verify", out, "verdicts", [p["target"] for p in payload],
++                         required=("ok",), bools=("ok",), source_field="source",
++                         valid_sources=by_name)
+         verdicts = out.get("verdicts") or {}
+     except Exception as exc:                     # noqa: BLE001
++        _llm_log("verify", "STOP", f"stage skipped ({type(exc).__name__}) — auto-accepted "
++                                   f"mappings stay auto-accepted without a second opinion")
+         spec.stats["llm_note"] = f"verification skipped: {exc}"
+         return
+ 
+@@ -2262,6 +2612,7 @@
+             m.rationale = (f"{m.rationale} Held for review: the LLM did not "
+                            f"corroborate the deterministic source choice.").strip()
+         demoted += 1
++    _llm_log("verify", "DONE", f"{len(auto)} auto-accepted mapping(s) checked, {demoted} demoted")
+     if demoted:
+         spec.stats["llm_demotions"] = demoted
+ 
+@@ -2318,7 +2669,7 @@
+     stands, so this tier can only improve on what was there.
+     """
+     from .. import config
+-    client, model = config.llm_client()
++    client, model = _llm_client("map_values", config)
+     if client is None:
+         return
+ 
+@@ -2337,6 +2688,7 @@
+             continue
+         todo.append((m, col, target))
+     if not todo:
++        _llm_log("map_values", "SKIP", "no mappings with untranslated codes — no call needed")
+         return
+ 
+     def _counts(col_name: str) -> dict:
+@@ -2365,13 +2717,16 @@
+         })
+ 
+     try:
+-        out = _llm_json(client, model,
++        out = _llm_call("map_values", client, model,
+                         [{"role": "system", "content": _VALUE_MAP_SYS},
+                          {"role": "user", "content": json.dumps(
+                              {"mappings": payload}, default=str)}],
+                         max_tokens=300 + 150 * len(payload))
++        _llm_check_keyed("map_values", out, "mappings", [p["target"] for p in payload],
++                         required=("values",), dicts=("values",))
+         proposed = out.get("mappings") or {}
+     except Exception as exc:                  # noqa: BLE001
++        _llm_log("map_values", "STOP", f"stage skipped ({type(exc).__name__}) — codes stay untranslated")
+         spec.stats["llm_note"] = f"value mapping skipped: {exc}"
+         return
+ 
+@@ -2379,28 +2734,50 @@
+     for m, col, target in todo:
+         p = proposed.get(m.target_attribute)
+         if not isinstance(p, dict):
++            _llm_log("map_values", "SKIP", f"{m.target_attribute}: no usable entry in the reply")
+             continue
+         pairs = p.get("values")
+         if not isinstance(pairs, dict):
++            _llm_log("map_values", "SKIP", f"{m.target_attribute}: 'values' is not a code->value object")
+             continue
+         allowed = {str(v) for v in (target.get("allowed_values") or [])}
++        invented = [c for c in pairs if c not in col.value_decode]
++        if invented:
++            _llm_bump("map_values", "reply_issues")
++            _llm_log("map_values", "WARN", f"{m.target_attribute}: ignoring code(s) not in the source "
++                                           f"decode table: {_llm_short(invented)} (known: "
++                                           f"{_llm_short(list(col.value_decode))})")
++        odd = [f"{c}={v!r}" for c, v in pairs.items()
++               if v is not None and not isinstance(v, (str, int, float))]
++        if odd:
++            _llm_bump("map_values", "reply_issues")
++            _llm_log("map_values", "WARN", f"{m.target_attribute}: non-scalar target value(s) "
++                                           f"{_llm_short(odd)}")
+         chosen: dict = {}
++        rejected = False
+         for code, value in pairs.items():
+             if code not in col.value_decode:
+                 continue                      # invented a code: ignore it
+             if value is None:
+                 continue                      # explicitly no equivalent
+             if allowed and str(value) not in allowed:
++                _llm_drop("map_values", f"{m.target_attribute}: {code!r} -> {value!r} is outside "
++                                        f"the permitted values {sorted(allowed)} — whole proposal rejected")
++                rejected = True
+                 chosen = {}                   # outside the contract: reject wholesale
+                 break
+             chosen[code] = str(value)
+         if not chosen:
++            if not rejected:
++                _llm_log("map_values", "SKIP", f"{m.target_attribute}: no code mapped to a permitted value")
+             continue
+ 
+         whens = " ".join(f"WHEN {_lit(c)} THEN {_lit(v)}" for c, v in chosen.items())
+         sql = f'CASE "{col.name}" {whens} ELSE NULL END'
+         coverage = _validate(warehouse, source_table, sql, [col.name])
+         if not coverage:
++            _llm_drop("map_values", f"{m.target_attribute}: CASE failed to execute or produced no "
++                                    f"values — {sql[:200]}")
+             continue                          # did not execute, or produced nothing
+ 
+         still = [c for c in col.value_decode if c not in chosen]
+@@ -2421,5 +2798,6 @@
+             + (f"; {', '.join(still)} left unmapped" if still else "")
+             + ". A human must confirm the business meaning.").strip()
+         applied += 1
++    _llm_log("map_values", "DONE", f"{applied}/{len(todo)} code translation(s) applied")
+     if applied:
+         spec.stats["llm_value_maps"] = applied
